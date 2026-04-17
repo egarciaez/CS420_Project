@@ -14,7 +14,7 @@ Use **Python 3.9, 3.10, 3.11, or 3.12** inside a dedicated virtual environment.
   This project has been used with **Python 3.9** so reccomend using it (e.g. a venv named `.venv39`). You can use **3.10–3.12** the same way; just swap the command and folder name:
 
   ```bash
-  python3.9 -m venv .venv39
+  python3 -m venv .venv39 
   source .venv39/bin/activate   # Windows: .venv39\Scripts\activate
   python -m pip install --upgrade pip
   ```

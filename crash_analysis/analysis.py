@@ -1,3 +1,4 @@
+# main script for our crash detection demo (opencv + yolo + roboflow)
 import argparse
 import logging
 import os
@@ -13,13 +14,13 @@ from ultralytics import YOLO
 from inference_sdk import InferenceHTTPClient
 
 try:
-    # Optional: lets you keep secrets in a local `.env` file.
+    # Optional for .env file.
     from dotenv import load_dotenv  # type: ignore
 except Exception:  # pragma: no cover
     load_dotenv = None  # type: ignore
 
-
 def _env_bool(key: str, default: bool) -> bool:
+    # Read an env var as boolean (1/true/yes etc); if missing or weird, return default.
     raw = os.environ.get(key, "").strip().lower()
     if raw == "":
         return default
@@ -31,6 +32,7 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 def _env_float(key: str, default: float) -> float:
+    # Read an env var as float; empty or invalid string -> use default.
     raw = os.environ.get(key, "").strip()
     if raw == "":
         return default
@@ -41,6 +43,7 @@ def _env_float(key: str, default: float) -> float:
 
 
 def _env_int(key: str, default: int) -> int:
+    # Read an env var as int; empty or invalid string -> use default.
     raw = os.environ.get(key, "").strip()
     if raw == "":
         return default
@@ -51,7 +54,7 @@ def _env_int(key: str, default: int) -> int:
 
 
 def _pick_image_macos() -> str:
-    # Avoid Tk on macOS: some Tcl/Tk builds abort during Tk_Init on certain OS/Python combos.
+    # For macOS opens a Finder "choose file" dialog via AppleScript (avoids flaky Tk on some Python builds).
     script = (
         'set p to POSIX path of (choose file with prompt '
         '"Select an image" of type {"public.jpeg", "public.png", "public.tiff"})'
@@ -64,6 +67,7 @@ def _pick_image_macos() -> str:
 
 
 def _has_gui_display() -> bool:
+    # Checks if a graphical desktop session exists (needed for Tk/zenity on Linux).
     system = platform.system()
     if system == "Windows":
         return True
@@ -74,7 +78,7 @@ def _has_gui_display() -> bool:
 
 
 def _pick_image_tk() -> str:
-    # Tk file dialog works well on Windows/Linux desktops; avoid on macOS by default (see `_pick_image_interactive`).
+    # Cross-platform Tkinter file dialog; works best on Windows/Linux with a display.
     import tkinter as tk
     from tkinter import filedialog
 
@@ -101,6 +105,7 @@ def _pick_image_tk() -> str:
 
 
 def _pick_image_zenity() -> str:
+    # Linux fallback: zenity graphical file picker if the command is installed.
     exe = shutil.which("zenity")
     if not exe:
         return ""
@@ -122,6 +127,7 @@ def _pick_image_zenity() -> str:
 
 
 def _pick_image_kdialog() -> str:
+    # Linux fallback: KDE kdialog file picker if available.
     exe = shutil.which("kdialog")
     if not exe:
         return ""
@@ -150,6 +156,7 @@ def _pick_image_interactive() -> str:
     - Windows/Linux (GUI session): Tk file dialog (fallback: zenity/kdialog on Linux)
     - otherwise: empty string (caller should fall back to manual path entry)
     """
+    # Route to the right picker for this OS, then fall back to "" so caller can ask for a typed path.
     system = platform.system()
     if system == "Darwin":
         use_tk = os.environ.get("MACOS_IMAGE_PICKER", "osascript").strip().lower() in ("tk", "tkinter")
@@ -177,6 +184,7 @@ def _pick_image_interactive() -> str:
 
 
 def _is_prediction_dict(obj) -> bool:
+    # True if this dict has the fields we expect for a Roboflow-style bounding box.
     if not isinstance(obj, dict):
         return False
     required = {"x", "y", "width", "height"}
@@ -191,12 +199,14 @@ def _extract_predictions_from_workflow_result(result: Any) -> List[Dict[str, Any
     Workflows return nested JSON. We try to find a list of dicts that look like
     Roboflow-style predictions: {x, y, width, height, ...}.
     """
+    # Walk nested workflow JSON, collect prediction lists, dedupe boxes we see more than once.
     if result is None:
         return []
 
     candidates: List[List[Dict[str, Any]]] = []
 
     def walk(node, depth: int = 0) -> None:
+        # Recurse into dicts/lists to find prediction arrays; depth cap avoids runaway recursion.
         if depth > 10:
             return
 
@@ -240,6 +250,7 @@ def _extract_predictions_from_workflow_result(result: Any) -> List[Dict[str, Any
 
 
 def _xyxy_from_rf_pred(p: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    # Turn Roboflow center (x,y) + width/height into corner coords (x1,y1,x2,y2).
     cx = float(p["x"])
     cy = float(p["y"])
     w = float(p["width"])
@@ -248,6 +259,7 @@ def _xyxy_from_rf_pred(p: Dict[str, Any]) -> Tuple[float, float, float, float]:
 
 
 def _expand_xyxy(box: Tuple[float, float, float, float], margin: float) -> Tuple[float, float, float, float]:
+    # Pad or shrink the box by margin as a fraction of its width and height (for crash ROI).
     x1, y1, x2, y2 = box
     bw = max(0.0, x2 - x1)
     bh = max(0.0, y2 - y1)
@@ -257,6 +269,7 @@ def _expand_xyxy(box: Tuple[float, float, float, float], margin: float) -> Tuple
 
 
 def _intersection_area_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    # Area of overlap between two axis-aligned rectangles; zero if they only touch or miss.
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
     x1 = max(ax1, bx1)
@@ -269,6 +282,7 @@ def _intersection_area_xyxy(a: Tuple[float, float, float, float], b: Tuple[float
 
 
 def _iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    # Intersection-over-union: how much two boxes overlap, normalized by their combined area.
     inter = _intersection_area_xyxy(a, b)
     if inter <= 0:
         return 0.0
@@ -281,12 +295,14 @@ def _iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float
 
 
 def _center_in_xyxy(point: Tuple[float, float], box: Tuple[float, float, float, float]) -> bool:
+    # True if the point lies inside the rectangle (used to tie a vehicle box to the crash region).
     x, y = point
     x1, y1, x2, y2 = box
     return (x1 <= x <= x2) and (y1 <= y <= y2)
 
 
 def _is_vehicle_rf_class(name: str) -> bool:
+    # Decide if a model class name should count as a vehicle (skip people and generic crash words).
     n = name.lower().strip()
     if not n:
         return False
@@ -302,6 +318,7 @@ def _is_vehicle_rf_class(name: str) -> bool:
 
 
 def _is_crash_rf_class(name: str) -> bool:
+    # True if the label text sounds like a crash / accident / rollover type class.
     n = name.lower()
     return (
         ("crash" in n)
@@ -315,15 +332,19 @@ def _is_crash_rf_class(name: str) -> bool:
 
 
 def _tree_hit_from_rf_class(name: str) -> bool:
+    # UI hint (for roboflow ): if label mentions tree or "hitting" so we can show a tree-collision line.
     n = name.lower()
     return ("tree" in n) or ("hiting" in n) or ("hitting" in n)
 
 
 def _rollover_from_rf_class(name: str) -> bool:
+    # UI hint: "flip" in the class name suggests rollover wording.
     return "flip" in name.lower()
 
 
+# For on-screen text for labeling images
 def _overlay_font_scale(img_w: int, img_h: int) -> float:
+    # Picks a font scale that looks ok on big/small images; OVERLAY_FONT_SCALE env overrides.
     env = os.environ.get("OVERLAY_FONT_SCALE", "").strip()
     if env:
         try:
@@ -343,6 +364,7 @@ def _overlay_font_scale(img_w: int, img_h: int) -> float:
 
 def _pil_load_sans(size_px: int) -> Any:
     """Return a Pillow ImageFont, or None if no system sans TTF is available."""
+    # Load a normal sans font from well-known OS paths so labels arent bitmap-jaggy.
     try:
         from PIL import ImageFont
     except ImportError:
@@ -396,6 +418,7 @@ def _draw_multiline_label_pil(
     """
     Antialiased TrueType overlay (display-only). Returns False to fall back to OpenCV Hershey text.
     """
+    # Draw several lines of text with outline + tinted rectangle behind; mutates img in place.
     try:
         from PIL import Image, ImageDraw
     except ImportError:
@@ -475,6 +498,7 @@ def _draw_multiline_label(
     margin: int = 10,
     line_spacing: float = 1.15,
 ) -> None:
+    # Draw a multi-line status message: try PIL for nice fonts, else OpenCV putText.
     h, w = img.shape[:2]
     if font_scale is None:
         font_scale = _overlay_font_scale(w, h)
@@ -558,6 +582,9 @@ def _draw_multiline_label(
         cur_base_y += step_y
 
 
+# App class: loads models, runs analyze_path(), handles the gui loop 
+
+
 class CrashAnalysisApp:
     def __init__(
         self,
@@ -566,6 +593,7 @@ class CrashAnalysisApp:
         workspace_name: Optional[str],
         workflow_id: Optional[str],
     ):
+        # Wire up Roboflow HTTP client and remember model vs workflow mode; YOLO loads later.
         # YOLO is optional (often poor on wrecked / aerial imagery when using COCO pretrained weights).
         self._yolo_model = None
         self.rf_client = InferenceHTTPClient(
@@ -577,6 +605,7 @@ class CrashAnalysisApp:
         self.workflow_id = workflow_id
 
     def _get_yolo(self):
+        # First call loads Ultralytics YOLO from disk (weights path in env) and later calls reuse same model.
         if self._yolo_model is None:
             # Ultralytics can be chatty on stderr even with verbose=False.
             for name in ("ultralytics", "ultralytics.nn", "torch"):
@@ -586,11 +615,13 @@ class CrashAnalysisApp:
         return self._yolo_model
 
     def check_overlap(self, boxA, boxB):
+        # Quick AABB overlap test: true if intersection area of two xyxy boxes is positive.
         xA, yA, xB, yB = max(boxA[0], boxB[0]), max(boxA[1], boxB[1]), min(boxA[2], boxB[2]), min(boxA[3], boxB[3])
         interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
         return interArea > 0
 
     def _yolo_vehicle_detections(self, frame) -> List[Tuple[str, float, Tuple[float, float, float, float]]]:
+        # Run YOLO on one BGR image; return list of (class name, score, xyxy box) for vehicle-like COCO classes.
         conf = _env_float("YOLO_CONF", 0.25)
         iou = _env_float("YOLO_IOU", 0.7)
         imgsz = _env_int("YOLO_IMGSZ", 960)
@@ -610,6 +641,7 @@ class CrashAnalysisApp:
 
     def _yolo_obstacle_detections(self, frame) -> List[Tuple[str, float, Any]]:
         """Best-effort COCO 'obstacle-ish' classes for overlap hints (optional)."""
+        # Same YOLO pass but only keep a couple COCO classes we use as weak obstacle hints in detailed UI.
         conf = _env_float("YOLO_CONF", 0.25)
         iou = _env_float("YOLO_IOU", 0.7)
         imgsz = _env_int("YOLO_IMGSZ", 960)
@@ -627,6 +659,7 @@ class CrashAnalysisApp:
         return out
 
     def _draw_yolo_vehicle_boxes(self, img, dets: List[Tuple[str, float, Tuple[float, float, float, float]]]) -> None:
+        # Overlay green rectangles + labels for each YOLO vehicle detection (fallback visualization).
         ih, iw = img.shape[:2]
         fs = _overlay_font_scale(iw, ih)
         th = max(1, int(round(fs * 2)))
@@ -647,6 +680,7 @@ class CrashAnalysisApp:
             )
 
     def _best_crash_prediction(self, predictions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        # From all boxes, keep ones that look like "crash" classes and pick highest confidence.
         crash_candidates = [p for p in predictions if _is_crash_rf_class(str(p.get("class", "")))]
         if not crash_candidates:
             return None
@@ -656,6 +690,7 @@ class CrashAnalysisApp:
         """
         Returns (predictions_list, raw_payload) where predictions_list is best-effort normalized.
         """
+        # Call Roboflow: either a hosted workflow (nested JSON) or a single model infer on disk path.
         use_workflow = bool(self.workspace_name and self.workflow_id)
         if use_workflow:
             raw = self.rf_client.run_workflow(
@@ -680,6 +715,7 @@ class CrashAnalysisApp:
             "quit" if the user asked to exit from the OpenCV window (q / Esc)
             "continue" otherwise
         """
+        # End-to-end for one image path: load pixels, call Roboflow (and maybe YOLO), draw result, wait for window key.
         print(f"Analyzing: {file_path}")
 
         # Load Image
@@ -706,6 +742,7 @@ class CrashAnalysisApp:
         rf_result: Any = None
 
         # 2. Roboflow Accident Verification
+        # Uses the api (or workflow) for predictions 
         try:
             predictions, rf_result = self._roboflow_predict(file_path)
         except Exception as e:
@@ -733,6 +770,7 @@ class CrashAnalysisApp:
         crash_conf = float(crash_pred.get("confidence", 0) or 0.0) if crash_pred else 0.0
         crash_ok = bool(crash_pred) and crash_conf >= crash_min_conf
 
+        # if we think theres a crash, count vehicles in the roi and draw red box
         if crash_ok:
             p_crash = crash_pred
             assert p_crash is not None
@@ -822,6 +860,7 @@ class CrashAnalysisApp:
             _draw_multiline_label(display_frame, result_msg, (20, 40))
             print(result_msg)
         else:
+            # no strong crash from roboflow -> optional yolo pass just to show cars
             # No confident crash detection from Roboflow -> drone-friendly YOLO vehicle pass
             if crash_pred and crash_conf < crash_min_conf and debug_rf:
                 print(f"No crash accepted (best crash conf={crash_conf:.3f} < {crash_min_conf:.3f}).")
@@ -850,16 +889,36 @@ class CrashAnalysisApp:
                     _draw_multiline_label(display_frame, "No collision detected in this image.", (20, 40))
 
         cv2.imshow("Detection Result", display_frame)
-        print("In the image window: press Q (or Esc) to quit, or press any other key to analyze another image.")
-        key = cv2.waitKey(0)
-        key8 = key & 0xFF
+        # waitKey(1) lets the window paint; long waitKey(0) only sees keys when this window has focus.
+        cv2.waitKey(1)
+
+        key_prompt = os.environ.get("CRASH_KEY_PROMPT", "terminal").strip().lower()
+        if key_prompt not in ("terminal", "window"):
+            key_prompt = "terminal"
+
+        if key_prompt == "window":
+            print("In the image window: press Q (or Esc) to quit, or any other key for another image.")
+            key = cv2.waitKey(0)
+            key8 = key & 0xFF
+            cv2.destroyAllWindows()
+            if key8 in (27, ord("q"), ord("Q")):
+                print("Quit requested.")
+                return "quit"
+            return "continue"
+
+        print(
+            "Image window should be visible. In this terminal: press Enter for another image, "
+            "or type q (or quit) then Enter to exit."
+        )
+        line = input().strip().lower()
         cv2.destroyAllWindows()
-        if key8 in (27, ord("q"), ord("Q")):
+        if line in ("q", "quit", "exit"):
             print("Quit requested.")
             return "quit"
         return "continue"
 
     def run_interactive(self, loop: bool) -> None:
+        # CLI loop: pick or type an image path, analyze it, repeat until user exits or --once mode.
         while True:
             system = platform.system()
             if system == "Darwin":
@@ -888,14 +947,15 @@ class CrashAnalysisApp:
                 return
 
 
-# --- Execution ---
+# Run from terminal: python analysis.py [--image path] [--once] ---
 if __name__ == "__main__":
+    # Parse CLI flags, load .env + API key, build app, then either analyze one path or interactive mode.
     parser = argparse.ArgumentParser(description="Car crash analysis (YOLO + Roboflow)")
     parser.add_argument("--image", help="Path to an image to analyze (skips file picker)")
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Pick/analyze only one image in interactive mode (default is multi-image until you press q/Esc in the result window).",
+        help="Pick/analyze only one image in interactive mode (default is multi-image until you quit from the prompt after each result).",
     )
     args = parser.parse_args()
 
@@ -913,6 +973,8 @@ if __name__ == "__main__":
     # Workflow mode (Roboflow snippet):
     #   export ROBOFLOW_WORKSPACE_NAME="project-workspace-h8j0c"
     #   export ROBOFLOW_WORKFLOW_ID="detect-count-and-visualize"
+    #
+    # After each result: default is terminal (Enter / q+Enter). Old behavior: export CRASH_KEY_PROMPT=window
     MODEL_ID = os.environ.get("ROBOFLOW_MODEL_ID", "").strip() or None
     WORKSPACE_NAME = os.environ.get("ROBOFLOW_WORKSPACE_NAME", "").strip() or None
     WORKFLOW_ID = os.environ.get("ROBOFLOW_WORKFLOW_ID", "").strip() or None
