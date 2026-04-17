@@ -1,4 +1,4 @@
-# main script for our crash detection demo (opencv + yolo + roboflow)
+# Main script for crash detection demo (opencv + yolo + roboflow)
 import argparse
 import logging
 import os
