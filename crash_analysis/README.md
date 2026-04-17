@@ -19,6 +19,8 @@ Use **Python 3.9, 3.10, 3.11, or 3.12** inside a dedicated virtual environment.
   python -m pip install --upgrade pip
   ```
 
+ - Other example line python3.9 -m venv .venv39 
+
 - If you see **NumPy / PyTorch** binary errors after installing, try pinning NumPy 1.x before or after installing the rest:
 
   ```bash
