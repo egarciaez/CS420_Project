@@ -51,6 +51,7 @@ class DroneNavigation:
         stripe_y = (self.horizontal_road_top_y + self.horizontal_road_bottom_y) / 2
         stripe_width = 30
         stripe_gap = 20
+        # Lane markers are visual details only; navigation ignores them.
         x = 10
         while x < self.canvas_width:
             self.canvas.create_rectangle(
@@ -194,6 +195,7 @@ class DroneNavigation:
                         wx1, wy1, wx1 + 8, wy1 + 10,
                         fill="#DDE7F0", outline="#93A2AF"
                     )
+            # Only these rectangles are used by collision and line-of-sight logic.
             self.blocking_structures.append((x1, y1 - roof_h, x2, y2))
 
     def get_drone_center(self):
@@ -221,6 +223,7 @@ class DroneNavigation:
         safe_target = self.find_valid_crash_location(target[0], target[1])
         self.crash_site_x, self.crash_site_y = safe_target
         self.on_arrival = callback
+        # Start in search mode and clear previous mission progress.
         self.navigation_state = "searching"
         self.is_finished = False
         self.detour_waypoint = None
@@ -230,6 +233,7 @@ class DroneNavigation:
         self.move()
 
     def generate_search_path(self):
+        # Zig-zag sweep helps the drone gain line-of-sight before direct approach.
         path = []
         margin = 50
         top_band = max(55, int(self.horizontal_road_top_y - 45))
@@ -249,7 +253,8 @@ class DroneNavigation:
         )
 
     def segment_hits_rect(self, start_x, start_y, end_x, end_y, rect, padding=0):
-        # Discrete sampling is sufficient for this small simulation.
+        # Approximate intersection test: sample points along segment.
+        # This is simpler than exact geometry and works well for this simulation.
         steps = 28
         for i in range(steps + 1):
             t = i / steps
@@ -260,7 +265,7 @@ class DroneNavigation:
         return False
 
     def get_blocking_structure(self, from_x, from_y, to_x, to_y):
-        # Return the closest blocking structure along the segment.
+        # Return only the nearest blocker along the segment.
         blockers = []
         for x1, y1, x2, y2 in self.blocking_structures:
             if self.segment_hits_rect(from_x, from_y, to_x, to_y, (x1, y1, x2, y2), padding=10):
@@ -340,7 +345,10 @@ class DroneNavigation:
                 self.canvas_height - candidate_y,
             )
 
-            # Prefer candidates reachable without crossing structures.
+            # Scoring:
+            # +140 if current -> candidate is blocked
+            # +70 if candidate -> goal is blocked
+            # -small bonus for staying away from map edges
             path_blocked = self.get_blocking_structure(current_x, current_y, candidate_x, candidate_y) is not None
             to_goal_blocked = self.get_blocking_structure(candidate_x, candidate_y, goal_x, goal_y) is not None
             distance_score = ((goal_x - candidate_x) ** 2 + (goal_y - candidate_y) ** 2) ** 0.5
@@ -366,6 +374,7 @@ class DroneNavigation:
         current_x, current_y = self.get_drone_center()
         goal_x, goal_y = target_x, target_y
 
+        # If a detour is active, keeps following it before retrying direct travel.
         if self.detour_waypoint:
             detour_x, detour_y = self.detour_waypoint
             detour_dist = ((detour_x - current_x) ** 2 + (detour_y - current_y) ** 2) ** 0.5
@@ -399,6 +408,7 @@ class DroneNavigation:
         if self.is_finished:
             return
 
+        # Two parts: searches (scans) first, then final approach to crash site.
         if self.navigation_state == "searching":
             # 1st: sweep waypoints until direct line-of-sight is clear.
             if self.has_line_of_sight_to_crash():
@@ -415,7 +425,7 @@ class DroneNavigation:
 
                 self.navigation_state = "to_crash"
 
-        # 2nd: approach crash site with detours around structures.
+        # 2nd: approaches crash site with detours around structures.
         dx, dy, reached = self.move_toward(self.crash_site_x, self.crash_site_y, speed=5)
         self.canvas.move(self.drone_tag, dx, dy)
 
@@ -429,7 +439,7 @@ class DroneNavigation:
 
 
 
-# TEST MODE (RUN FILE ALONE)
+# RUNS FILE
 
 if __name__ == "__main__":
     import tkinter as tk
@@ -439,29 +449,54 @@ if __name__ == "__main__":
 
     canvas = tk.Canvas(root, width=900, height=600, highlightthickness=0)
     canvas.pack()
+    controls = tk.Frame(root)
+    controls.pack(pady=6)
 
     def done(location):
         print("Reached:", location)
 
-    nav = DroneNavigation(canvas)
+    nav_holder = {"nav": None}
 
-    # Random crash location (always on road/intersection).
-    raw_crash_location = nav.random_road_location()
-    crash_location = nav.find_valid_crash_location(*raw_crash_location)
+    def run_simulation():
+        # Stops old mission loop first so old and new animation loops do not overlap.
+        # Then clears old sprites/markers before creating a fresh mission.
+        previous_nav = nav_holder["nav"]
+        if previous_nav is not None:
+            previous_nav.is_finished = True
+        canvas.delete("drone")
+        canvas.delete("crash_marker")
 
-    # Draw crash site marker
-    canvas.create_oval(
-        crash_location[0]-10,
-        crash_location[1]-10,
-        crash_location[0]+10,
-        crash_location[1]+10,
-        fill="#CC2B2B", outline="#7A1414", width=2
-    )
-    canvas.create_text(
-        crash_location[0], crash_location[1] + 18,
-        text="CRASH", fill="#7A1414", font=("Arial", 9, "bold")
-    )
+        nav = DroneNavigation(canvas)
+        nav_holder["nav"] = nav
 
-    nav.start(crash_location, done)
+        # Random crash location (always on road/intersection).
+        raw_crash_location = nav.random_road_location()
+        crash_location = nav.find_valid_crash_location(*raw_crash_location)
+
+        # Draw crash site marker.
+        canvas.create_oval(
+            crash_location[0] - 10,
+            crash_location[1] - 10,
+            crash_location[0] + 10,
+            crash_location[1] + 10,
+            fill="#CC2B2B",
+            outline="#7A1414",
+            width=2,
+            tags="crash_marker",
+        )
+        canvas.create_text(
+            crash_location[0],
+            crash_location[1] + 18,
+            text="CRASH",
+            fill="#7A1414",
+            font=("Arial", 9, "bold"),
+            tags="crash_marker",
+        )
+
+        nav.start(crash_location, done)
+
+    tk.Button(controls, text="Run Again", command=run_simulation).pack()
+
+    run_simulation()
 
     root.mainloop()
