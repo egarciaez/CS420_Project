@@ -445,7 +445,7 @@ if __name__ == "__main__":
     import tkinter as tk
 
     root = tk.Tk()
-    root.title("Drone Navigation Test")
+    root.title("Drone Navigation Simulation")
 
     canvas = tk.Canvas(root, width=900, height=600, highlightthickness=0)
     canvas.pack()
