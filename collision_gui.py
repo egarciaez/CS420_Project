@@ -76,8 +76,8 @@ class CollisionAnalysisGUI:
 
 
         ttk.Label(self.left_panel, text="Status", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
-        self.car_count_label = ttk.Label(self.left_panel, text="Cars Involved: [ 0 ]", style="Status.TLabel") # [cite: 363]
-        self.car_count_label.pack(anchor="w", pady=2)
+        self.status_label = ttk.Label(self.left_panel, text="Cars Involved: [ 0 ]", style="Status.TLabel") # [cite: 363]
+        self.status_label.pack(anchor="w", pady=2)
         ttk.Button(self.left_panel, text="Manual Override", command=self.manual_override).pack(fill="x", pady=(10, 15)) # [cite: 184]
 
     def _build_right_panel(self):
@@ -110,17 +110,17 @@ class CollisionAnalysisGUI:
         if cv2_frame is None:
             return
 
-        # Convert OpenCV BGR to Tkinter RGB
+        # convert OpenCV BGR to Tkinter RGB
         rgb_frame = cv2.cvtColor(cv2_frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb_frame)
         
-        # Get current canvas dimensions, with fallbacks
+        # get current canvas dimensions, with fallbacks
         canvas_width = self.camera_canvas.winfo_width()
         canvas_height = self.camera_canvas.winfo_height()
         if canvas_width <= 1: canvas_width = 600
         if canvas_height <= 1: canvas_height = 250
             
-        # Resize and render
+        # resize and render
         pil_image.thumbnail((canvas_width, canvas_height), Image.Resampling.LANCZOS)
         self.photo_image = ImageTk.PhotoImage(pil_image) 
 
@@ -145,6 +145,7 @@ class CollisionAnalysisGUI:
         
         display_frame = frame.copy()
         car_count = 0 
+        crash_type_text = "" 
 
         try:
             predictions, _ = self.backend_app._roboflow_predict(file_path)
@@ -161,7 +162,6 @@ class CollisionAnalysisGUI:
             cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
             
             rf_class = str(crash_pred.get("class", "")).strip()
-            crash_type_text = ""
             
             if _tree_hit_from_rf_class(rf_class):
                 crash_type_text = "\nType: Potential tree collision"
@@ -169,8 +169,7 @@ class CollisionAnalysisGUI:
                 crash_type_text = "\nType: Potential rollover"
             elif rf_class:
                 crash_type_text = f"\nType: {rf_class.title()}"
-            
-            # count vehicles from Roboflow first
+
             for pr in predictions:
                 cls_name = str(pr.get("class", "")).strip()
                 if _is_vehicle_rf_class(cls_name) and pr is not crash_pred:
@@ -192,22 +191,22 @@ class CollisionAnalysisGUI:
                 if involved_cars:
                     self.backend_app._draw_yolo_vehicle_boxes(display_frame, involved_cars)
 
-            # update the result message to include the crash type
-            result_msg = f"CRASH DETECTED{crash_type_text}\n{car_count} vehicles involved."
+            result_msg = f"CRASH DETECTED{crash_type_text}"
             
         else:
-            # fallback to YOLO if NO crash is found anywhere in the image
+            # fallback to YOLO if no crash is found anywhere in the image
             if _env_bool("YOLO_FALLBACK", True):
                 yolo_dets = self.backend_app._yolo_vehicle_detections(frame)
                 self.backend_app._draw_yolo_vehicle_boxes(display_frame, yolo_dets)
-                
                 car_count = len(yolo_dets)
                 result_msg = f"NO CRASH DETECTED\n{car_count} vehicles detected."
             else:
                 result_msg = "NO CRASH DETECTED"
 
-        # update the GUI Label
-        self.car_count_label.config(text=f"Cars Involved: [ {car_count} ]")
+        if result_msg.startswith("CRASH DETECTED"):
+            self.status_label.config(text=f"CRASH DETECTED{crash_type_text}")
+        else:
+            self.status_label.config(text="NO CRASH DETECTED")
 
         _draw_multiline_label(display_frame, result_msg, (20, 40))
         
