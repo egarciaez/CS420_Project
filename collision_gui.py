@@ -12,7 +12,9 @@ from analysis import (
     _expand_xyxy,
     _xyxy_from_rf_pred,
     _draw_multiline_label,
-    _is_vehicle_rf_class
+    _is_vehicle_rf_class,
+    _tree_hit_from_rf_class,
+    _rollover_from_rf_class
 )
 
 class CollisionAnalysisGUI:
@@ -73,14 +75,6 @@ class CollisionAnalysisGUI:
         ttk.Button(self.left_panel, text="Take Picture", command=self.take_picture).pack(fill="x", pady=(2, 15)) # [cite: 356]
 
 
-        ttk.Label(self.left_panel, text="Safety Features", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
-        # Using checkboxes (Checkbuttons) for toggleable warnings [cite: 280]
-        self.visual_warning_var = tk.BooleanVar(value=True)
-        self.audio_warning_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(self.left_panel, text="Visual Warnings", variable=self.visual_warning_var, style="TCheckbutton").pack(anchor="w", pady=2) # [cite: 360]
-        ttk.Checkbutton(self.left_panel, text="Audio Warnings", variable=self.audio_warning_var, style="TCheckbutton").pack(anchor="w", pady=(2, 15)) # [cite: 361]
-
-
         ttk.Label(self.left_panel, text="Status", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
         self.car_count_label = ttk.Label(self.left_panel, text="Cars Involved: [ 0 ]", style="Status.TLabel") # [cite: 363]
         self.car_count_label.pack(anchor="w", pady=2)
@@ -93,11 +87,6 @@ class CollisionAnalysisGUI:
         self.camera_canvas.pack(fill="both", expand=True, pady=(0, 15))
         self.camera_canvas.create_text(300, 125, text="Live Video / Uploaded Image Placeholder", fill="white", font=("Arial", 12))
 
-
-        ttk.Label(self.right_panel, text="Safety Perimeter Simulation", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
-        self.sim_canvas = tk.Canvas(self.right_panel, bg="#4a5a6a", height=250) # [cite: 366]
-        self.sim_canvas.pack(fill="both", expand=True, pady=(0, 15))
-        self.sim_canvas.create_text(300, 125, text="Drone Location & Safety Cones Placeholder", fill="white", font=("Arial", 12)) # [cite: 365, 366]
 
 
         ttk.Label(self.right_panel, text="System Console / Feedback", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
@@ -171,12 +160,21 @@ class CollisionAnalysisGUI:
             x1, y1, x2, y2 = crash_roi
             cv2.rectangle(display_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 3)
             
+            rf_class = str(crash_pred.get("class", "")).strip()
+            crash_type_text = ""
+            
+            if _tree_hit_from_rf_class(rf_class):
+                crash_type_text = "\nType: Potential tree collision"
+            elif _rollover_from_rf_class(rf_class):
+                crash_type_text = "\nType: Potential rollover"
+            elif rf_class:
+                crash_type_text = f"\nType: {rf_class.title()}"
+            
             # count vehicles from Roboflow first
             for pr in predictions:
                 cls_name = str(pr.get("class", "")).strip()
                 if _is_vehicle_rf_class(cls_name) and pr is not crash_pred:
                     car_count += 1
-                    # Draw an orange box for Roboflow-detected cars
                     vx1, vy1, vx2, vy2 = _xyxy_from_rf_pred(pr)
                     cv2.rectangle(display_frame, (int(vx1), int(vy1)), (int(vx2), int(vy2)), (255, 165, 0), 2)
 
@@ -187,16 +185,15 @@ class CollisionAnalysisGUI:
                 
                 for det in yolo_dets:
                     label, score, coords = det
-                    # Only count the YOLO car if it is inside or touching the red crash box
                     if self.backend_app.check_overlap(list(crash_roi), coords):
                         involved_cars.append(det)
                         car_count += 1
                         
-                # Draw green boxes for YOLO-detected cars so you can see them on screen
                 if involved_cars:
                     self.backend_app._draw_yolo_vehicle_boxes(display_frame, involved_cars)
 
-            result_msg = f"CRASH DETECTED\n{car_count} vehicles involved."
+            # update the result message to include the crash type
+            result_msg = f"CRASH DETECTED{crash_type_text}\n{car_count} vehicles involved."
             
         else:
             # fallback to YOLO if NO crash is found anywhere in the image
@@ -288,14 +285,13 @@ class CollisionAnalysisGUI:
         report_window.geometry("600x400")
         report_window.configure(bg="#1e1e1e")
         
-        # Add a header
         ttk.Label(report_window, text="System Crash Log", font=("Arial", 14, "bold"), background="#1e1e1e", foreground="#00a8cc").pack(pady=10)
         
-        # Add a scrolling text area
+        # scrolling text area
         text_area = tk.Text(report_window, wrap="word", bg="#2d2d2d", fg="white", font=("Courier", 10))
         text_area.pack(expand=True, fill="both", padx=10, pady=(0, 10))
         
-        # Try to read the locally saved report file
+        # read the locally saved report file
         try:
             with open("crash_report_log.txt", "r") as file:
                 logs = file.read()
@@ -306,8 +302,24 @@ class CollisionAnalysisGUI:
         except FileNotFoundError:
             text_area.insert(tk.END, "No report file found. Run a scan to generate the first report.")
             
-        # Make the text read-only
+        # make the text read-only initially
         text_area.config(state="disabled")
+
+        # clear the file and the screen
+        def _clear_and_refresh():
+            # clear text file
+            with open("crash_report_log.txt", "w") as file:
+                file.write("")
+            self.log_to_console("Report history has been cleared.")
+            
+            # u the text box, clear the screen, add placeholder, and re-lock
+            text_area.config(state="normal")
+            text_area.delete("1.0", tk.END)
+            text_area.insert(tk.END, "No crashes have been logged yet.")
+            text_area.config(state="disabled")
+
+        clear_btn = ttk.Button(report_window, text="Clear", command=_clear_and_refresh)
+        clear_btn.place(x=10, y=10)
         
     def toggle_live_feed(self):
         self.log_to_console("Toggling Live Video Feed...")
