@@ -148,9 +148,10 @@ class CollisionAnalysisGUI:
         crash_type_text = "" 
 
         try:
-            predictions, _ = self.backend_app._roboflow_predict(file_path)
+         predictions, _ = self.backend_app._roboflow_predict(file_path)
         except Exception as e:
-            return display_frame, f"API Error: {e}"
+            self.log_to_console(f"Roboflow unavailable: {e}. Falling back to YOLO...")
+            predictions = []
 
         crash_pred = self.backend_app._best_crash_prediction(predictions) if predictions else None
         crash_conf = float(crash_pred.get("confidence", 0) or 0.0) if crash_pred else 0.0
