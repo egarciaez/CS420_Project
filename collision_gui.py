@@ -3,8 +3,11 @@ from tkinter import ttk
 import os
 import cv2
 import datetime
+import tempfile
 from tkinter import filedialog
+from tkinter import messagebox
 from PIL import Image, ImageTk
+from drone_navigation import DroneNavigation
 from analysis import (
     CrashAnalysisApp,
     _env_float,
@@ -60,6 +63,92 @@ class CollisionAnalysisGUI:
 
         self.scan_active = False
         self.cap = None
+        self._tello = None
+        self._tello_frame_reader = None
+        self._tello_help_shown = False
+        self._manual_override_active = False
+        self._manual_control_window = None
+
+        self._drone_nav = None
+        self._drone_sim_running = False
+
+    def _connect_tello(self) -> bool:
+        """
+        Best-effort connect to a DJI Tello / Tello EDU using djitellopy.
+        Returns True on success; logs and returns False on failure.
+        """
+        try:
+            from djitellopy import Tello  # type: ignore
+        except Exception as e:
+            self.log_to_console(f"Tello connection unavailable (install djitellopy): {e}")
+            return False
+
+        try:
+            tello = Tello()
+            tello.connect()
+            try:
+                batt = tello.get_battery()
+                self.log_to_console(f"Tello connected (battery {batt}%). Starting video stream...")
+            except Exception:
+                self.log_to_console("Tello connected. Starting video stream...")
+            tello.streamon()
+            frame_reader = tello.get_frame_read()
+            self._tello = tello
+            self._tello_frame_reader = frame_reader
+            return True
+        except Exception as e:
+            self.log_to_console(f"Error: Could not connect to Tello stream: {e}")
+            try:
+                if self._tello is not None:
+                    self._tello.end()
+            except Exception:
+                pass
+            self._tello = None
+            self._tello_frame_reader = None
+            return False
+
+    def _disconnect_tello(self) -> None:
+        tello = self._tello
+        self._tello = None
+        self._tello_frame_reader = None
+        if tello is None:
+            return
+        try:
+            try:
+                tello.streamoff()
+            except Exception:
+                pass
+            try:
+                # Ensure we stop any RC control stream when disconnecting.
+                tello.send_rc_control(0, 0, 0, 0)
+            except Exception:
+                pass
+            tello.end()
+        except Exception:
+            pass
+
+    def _tello_send_rc(self, lr: int = 0, fb: int = 0, ud: int = 0, yaw: int = 0) -> None:
+        """Safe wrapper around send_rc_control (values in [-100,100])."""
+        if self._tello is None:
+            return
+        try:
+            self._tello.send_rc_control(int(lr), int(fb), int(ud), int(yaw))
+        except Exception as e:
+            self.log_to_console(f"Tello RC control failed: {e}")
+
+    def _tello_command(self, fn_name: str, *args) -> None:
+        """Call a tello method by name with basic error handling."""
+        tello = self._tello
+        if tello is None:
+            return
+        fn = getattr(tello, fn_name, None)
+        if fn is None:
+            self.log_to_console(f"Tello command not supported: {fn_name}")
+            return
+        try:
+            fn(*args)
+        except Exception as e:
+            self.log_to_console(f"Tello command failed ({fn_name}): {e}")
 
     def _build_left_panel(self):
 
@@ -78,6 +167,7 @@ class CollisionAnalysisGUI:
         ttk.Label(self.left_panel, text="Status", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
         self.status_label = ttk.Label(self.left_panel, text="Cars Involved: [ 0 ]", style="Status.TLabel") # [cite: 363]
         self.status_label.pack(anchor="w", pady=2)
+        ttk.Button(self.left_panel, text="Run Simulation", command=self.start_drone_simulation).pack(fill="x", pady=(10, 2))
         ttk.Button(self.left_panel, text="Manual Override", command=self.manual_override).pack(fill="x", pady=(10, 15)) # [cite: 184]
 
     def _build_right_panel(self):
@@ -88,6 +178,16 @@ class CollisionAnalysisGUI:
         self.camera_canvas.create_text(300, 125, text="Live Video / Uploaded Image Placeholder", fill="white", font=("Arial", 12))
 
 
+
+        ttk.Label(self.right_panel, text="Safety Perimeter Simulation", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
+        self.sim_canvas = tk.Canvas(self.right_panel, bg="#a0a0a0", width=900, height=260, highlightthickness=0)
+        self.sim_canvas.pack(fill="x", expand=False, pady=(0, 15))
+        self.sim_canvas.create_text(
+            450, 130,
+            text="Simulation will run here when a crash is detected",
+            fill="white",
+            font=("Arial", 12),
+        )
 
         ttk.Label(self.right_panel, text="System Console / Feedback", style="Header.TLabel").pack(anchor="w", pady=(0, 5))
         self.console_text = tk.Text(self.right_panel, height=8, bg="#005f73", fg="white", font=("Courier", 10), state="disabled")
@@ -206,12 +306,87 @@ class CollisionAnalysisGUI:
 
         if result_msg.startswith("CRASH DETECTED"):
             self.status_label.config(text=f"CRASH DETECTED{crash_type_text}")
+            self._maybe_trigger_drone_simulation()
         else:
             self.status_label.config(text="NO CRASH DETECTED")
 
         _draw_multiline_label(display_frame, result_msg, (20, 40))
         
         return display_frame, result_msg
+
+    def _maybe_trigger_drone_simulation(self):
+        # Avoid retriggering on every live-feed frame while a mission is already running.
+        if self._drone_sim_running:
+            return
+        self.start_drone_simulation()
+
+    def start_drone_simulation(self):
+        # Stops any previous mission loop, clears the simulation canvas,
+        # then runs the navigation animation to a crash marker.
+        if self._drone_nav is not None:
+            self._drone_nav.is_finished = True
+
+        self.sim_canvas.delete("all")
+        self._drone_nav = DroneNavigation(self.sim_canvas)
+        nav = self._drone_nav
+
+        raw_crash_location = nav.random_road_location()
+        crash_location = nav.find_valid_crash_location(*raw_crash_location)
+
+        self.sim_canvas.create_oval(
+            crash_location[0] - 10,
+            crash_location[1] - 10,
+            crash_location[0] + 10,
+            crash_location[1] + 10,
+            fill="#CC2B2B",
+            outline="#7A1414",
+            width=2,
+            tags="crash_marker",
+        )
+        self.sim_canvas.create_text(
+            crash_location[0],
+            crash_location[1] + 18,
+            text="CRASH",
+            fill="#7A1414",
+            font=("Arial", 9, "bold"),
+            tags="crash_marker",
+        )
+
+        self._drone_sim_running = True
+        self.log_to_console("Navigating to collision site...")
+
+        def _on_arrival(location):
+            self.log_to_console("Arrived at collision site. Deploying cones...")
+            self._drone_sim_running = False
+            self._draw_cones_around(location)
+
+        nav.start(crash_location, _on_arrival)
+
+    def _draw_cones_around(self, location):
+        cx, cy = location
+        cone_points = [
+            (cx - 55, cy - 25),
+            (cx - 10, cy - 55),
+            (cx + 40, cy - 30),
+            (cx + 55, cy + 25),
+            (cx + 0, cy + 55),
+            (cx - 40, cy + 30),
+        ]
+        for x, y in cone_points:
+            self.sim_canvas.create_oval(
+                x - 12, y - 12, x + 12, y + 12,
+                fill="#C28B2E",
+                outline="#6E4B16",
+                width=2,
+                tags="cone",
+            )
+            self.sim_canvas.create_text(
+                x, y,
+                text="Cone",
+                fill="white",
+                font=("Arial", 8, "bold"),
+                tags="cone",
+            )
 
 
 
@@ -222,16 +397,32 @@ class CollisionAnalysisGUI:
             self.log_to_console("Scan is already running.")
             return
             
+        use_tello = _env_bool("USE_TELLO", False)
         self.log_to_console("Scan Started: Connecting to camera...")
         self.scan_active = True
-        
-        # open the default webcam
-        self.cap = cv2.VideoCapture(0)
-        
-        if not self.cap.isOpened():
-            self.log_to_console("Error: Could not open camera feed.")
-            self.scan_active = False
-            return
+
+        if use_tello:
+            if not self._tello_help_shown:
+                self._tello_help_shown = True
+                messagebox.showinfo(
+                    "Connect to Tello Wi‑Fi",
+                    "To use the Tello EDU camera stream:\n\n"
+                    "1) Power on the Tello.\n"
+                    "2) On your PC, connect to the Tello's Wi‑Fi (SSID usually starts with 'TELLO-').\n"
+                    "3) Then click Start Scan again if needed.\n\n"
+                    "If it can’t connect, the app will fall back to your webcam.",
+                )
+            if not self._connect_tello():
+                self.log_to_console("Falling back to webcam...")
+                use_tello = False
+
+        if not use_tello:
+            # open the default webcam
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                self.log_to_console("Error: Could not open camera feed.")
+                self.scan_active = False
+                return
             
         # continuous loop
         self.update_scan()
@@ -243,30 +434,53 @@ class CollisionAnalysisGUI:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+
+        self._disconnect_tello()
             
         self.camera_canvas.delete("all")
         self.camera_canvas.create_text(300, 125, text="Live Feed Stopped", fill="white", font=("Arial", 12))
 
     def update_scan(self):
         # stop the loop if the user clicked "Stop Scan" or the camera isn't initialized
-        if not self.scan_active or self.cap is None:
+        if not self.scan_active:
             return
 
-        ret, frame = self.cap.read()
+        frame = None
+        ret = False
+        if self._tello_frame_reader is not None:
+            # djitellopy returns frames as numpy arrays; they are usable directly by OpenCV.
+            frame = self._tello_frame_reader.frame
+            ret = frame is not None
+        elif self.cap is not None:
+            ret, frame = self.cap.read()
         
         if ret:
-            # save the frame to a temporary file so the backend can read it
-            temp_filename = "temp_live_frame.jpg"
-            cv2.imwrite(temp_filename, frame)
-            
-            # process the temporary image just like an uploaded image
-            processed_frame, result_message = self.process_image_for_gui(temp_filename)
-            
-            # save to the report log ONLY if a crash is detected to avoid spamming the log
-            if "CRASH DETECTED" in result_message:
-                self.save_to_report("Live Feed", result_message)
+            if self._manual_override_active:
+                # Pilot mode: keep showing the live stream, but pause ML inference.
+                self.display_frame_on_canvas(frame)
+            else:
+                # Save the frame to a true temp location (NOT inside OneDrive),
+                # so live scanning doesn't constantly churn synced files.
+                temp_filename = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                        temp_filename = tmp.name
+                    cv2.imwrite(temp_filename, frame)
 
-            self.display_frame_on_canvas(processed_frame)
+                    # process the temporary image just like an uploaded image
+                    processed_frame, result_message = self.process_image_for_gui(temp_filename)
+                finally:
+                    if temp_filename and os.path.exists(temp_filename):
+                        try:
+                            os.remove(temp_filename)
+                        except OSError:
+                            pass
+
+                # save to the report log ONLY if a crash is detected to avoid spamming the log
+                if "CRASH DETECTED" in result_message:
+                    self.save_to_report("Live Feed", result_message)
+
+                self.display_frame_on_canvas(processed_frame)
 
         else:
             # camera disconnects or the video file ends
@@ -361,8 +575,148 @@ class CollisionAnalysisGUI:
         # TODO: Send command to drone hardware/simulation to capture a frame [cite: 181]
         
     def manual_override(self):
-        self.log_to_console("Manual Override Activated")
-        # TODO: Override automatic rescan functionality [cite: 184]
+        # Pilot mode: user manually controls the drone.
+        if self._manual_override_active:
+            self._manual_override_active = False
+            self.log_to_console("Manual Override Deactivated (automation resumed).")
+            try:
+                self._tello_send_rc(0, 0, 0, 0)
+            except Exception:
+                pass
+            if self._manual_control_window is not None:
+                try:
+                    self._manual_control_window.destroy()
+                except Exception:
+                    pass
+                self._manual_control_window = None
+            return
+
+        if self._tello is None:
+            messagebox.showwarning(
+                "Manual Override",
+                "No Tello is connected.\n\n"
+                "To enable manual control:\n"
+                "- Connect to the Tello Wi‑Fi (SSID usually starts with 'TELLO-')\n"
+                "- Set USE_TELLO=1 in your .env\n"
+                "- Click Start Scan to connect\n",
+            )
+            self.log_to_console("Manual Override requested, but no Tello is connected.")
+            return
+
+        self._manual_override_active = True
+        self.log_to_console("Manual Override Activated (pilot mode). ML inference paused.")
+        self._open_manual_control_window()
+
+    def _open_manual_control_window(self):
+        if self._manual_control_window is not None:
+            try:
+                self._manual_control_window.lift()
+                return
+            except Exception:
+                self._manual_control_window = None
+
+        win = tk.Toplevel(self.root)
+        win.title("Manual Drone Control (Tello)")
+        win.geometry("440x380")
+        win.configure(bg="#1e1e1e")
+        self._manual_control_window = win
+
+        header = ttk.Label(win, text="Pilot Mode Controls", style="Header.TLabel")
+        header.pack(anchor="w", padx=10, pady=(10, 6))
+
+        ttk.Label(
+            win,
+            text="Keyboard: WASD=move, QE=rotate, RF=up/down, X=stop, T=takeoff, L=land\nFlips: I=forward, K=back, J=left, O=right",
+            wraplength=410,
+            justify="left",
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+
+        speed = tk.IntVar(value=40)  # RC control speed
+
+        def _btn(text, cmd):
+            b = ttk.Button(win, text=text, command=cmd)
+            return b
+
+        grid = ttk.Frame(win)
+        grid.pack(padx=10, pady=(0, 10), fill="x")
+
+        # Movement buttons (send brief RC nudge)
+        def _nudge(lr=0, fb=0, ud=0, yaw=0, ms=250):
+            self._tello_send_rc(lr, fb, ud, yaw)
+            self.root.after(ms, lambda: self._tello_send_rc(0, 0, 0, 0))
+
+        s = lambda: int(speed.get())
+
+        _btn("Takeoff (T)", lambda: self._tello_command("takeoff")).pack(in_=grid, side="left", padx=4, pady=4)
+        _btn("Land (L)", lambda: self._tello_command("land")).pack(in_=grid, side="left", padx=4, pady=4)
+        _btn("STOP (X)", lambda: self._tello_send_rc(0, 0, 0, 0)).pack(in_=grid, side="left", padx=4, pady=4)
+
+        move = ttk.Frame(win)
+        move.pack(padx=10, pady=(0, 10))
+
+        _btn("Up (R)", lambda: _nudge(ud=s())).grid(in_=move, row=0, column=1, padx=4, pady=4)
+        _btn("Forward (W)", lambda: _nudge(fb=s())).grid(in_=move, row=1, column=1, padx=4, pady=4)
+        _btn("Left (A)", lambda: _nudge(lr=-s())).grid(in_=move, row=2, column=0, padx=4, pady=4)
+        _btn("Back (S)", lambda: _nudge(fb=-s())).grid(in_=move, row=2, column=1, padx=4, pady=4)
+        _btn("Right (D)", lambda: _nudge(lr=s())).grid(in_=move, row=2, column=2, padx=4, pady=4)
+        _btn("Down (F)", lambda: _nudge(ud=-s())).grid(in_=move, row=3, column=1, padx=4, pady=4)
+
+        _btn("Rotate CCW (Q)", lambda: _nudge(yaw=-s())).grid(in_=move, row=1, column=0, padx=4, pady=4)
+        _btn("Rotate CW (E)", lambda: _nudge(yaw=s())).grid(in_=move, row=1, column=2, padx=4, pady=4)
+
+        ttk.Label(win, text="Speed").pack(anchor="w", padx=10)
+        ttk.Scale(win, from_=10, to=100, variable=speed, orient="horizontal").pack(fill="x", padx=10, pady=(0, 10))
+
+        flips = ttk.Frame(win)
+        flips.pack(padx=10, pady=(0, 10), fill="x")
+        ttk.Label(flips, text="Flips").pack(anchor="w")
+
+        flip_row = ttk.Frame(flips)
+        flip_row.pack(anchor="w", pady=(4, 0))
+        _btn("Flip Forward (I)", lambda: self._tello_command("flip_forward")).pack(in_=flip_row, side="left", padx=4)
+        _btn("Flip Back (K)", lambda: self._tello_command("flip_back")).pack(in_=flip_row, side="left", padx=4)
+        _btn("Flip Left (J)", lambda: self._tello_command("flip_left")).pack(in_=flip_row, side="left", padx=4)
+        _btn("Flip Right (O)", lambda: self._tello_command("flip_right")).pack(in_=flip_row, side="left", padx=4)
+
+        def _on_close():
+            # Leaving pilot mode on close is dangerous; deactivate it.
+            self._manual_override_active = False
+            try:
+                self._tello_send_rc(0, 0, 0, 0)
+            except Exception:
+                pass
+            self.log_to_console("Manual Override window closed (automation resumed).")
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._manual_control_window = None
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        # Keyboard bindings (active while the window is focused)
+        def _bind(key, fn):
+            win.bind(key, lambda _e: fn())
+
+        _bind("<KeyPress-t>", lambda: self._tello_command("takeoff"))
+        _bind("<KeyPress-l>", lambda: self._tello_command("land"))
+        _bind("<KeyPress-x>", lambda: self._tello_send_rc(0, 0, 0, 0))
+
+        _bind("<KeyPress-w>", lambda: _nudge(fb=s()))
+        _bind("<KeyPress-s>", lambda: _nudge(fb=-s()))
+        _bind("<KeyPress-a>", lambda: _nudge(lr=-s()))
+        _bind("<KeyPress-d>", lambda: _nudge(lr=s()))
+        _bind("<KeyPress-r>", lambda: _nudge(ud=s()))
+        _bind("<KeyPress-f>", lambda: _nudge(ud=-s()))
+        _bind("<KeyPress-q>", lambda: _nudge(yaw=-s()))
+        _bind("<KeyPress-e>", lambda: _nudge(yaw=s()))
+
+        _bind("<KeyPress-i>", lambda: self._tello_command("flip_forward"))
+        _bind("<KeyPress-k>", lambda: self._tello_command("flip_back"))
+        _bind("<KeyPress-j>", lambda: self._tello_command("flip_left"))
+        _bind("<KeyPress-o>", lambda: self._tello_command("flip_right"))
+
+        win.focus_set()
 
 
 # --- Application Execution ---

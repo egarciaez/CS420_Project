@@ -1,0 +1,29 @@
+## Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+
+## Virtual environments (huge; don't commit)
+.venv/
+.venv*/
+venv/
+env/
+
+## Logs / outputs (avoid syncing/committing)
+crash_report_log.txt
+temp_live_frame.jpg
+outputs/
+
+## Secrets
+.env
+
+## ML weights (large binaries)
+*.pt
+
+## OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+

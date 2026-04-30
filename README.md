@@ -65,6 +65,44 @@ From the project directory, with the venv **activated** and `.env` present:
 python collision_gui.py
 ```
 
+### Using a DJI Tello / Tello EDU (optional)
+
+By default, **Start Scan** uses your webcam. To use a **Tello EDU** camera stream instead:
+
+1. Install the Tello Python library:
+
+```bash
+python -m pip install djitellopy
+```
+
+2. Connect your computer to the drone’s Wi‑Fi:
+   - Power on the Tello.
+   - On your PC, connect to the SSID that typically starts with **`TELLO-`**.
+
+3. Enable the drone stream in your `.env`:
+
+```bash
+USE_TELLO=1
+```
+
+4. Launch the GUI and click **Start Scan**.
+
+If the app can’t connect to the drone stream, it will **log an error and fall back to your webcam**.
+
+### Manual Override (Pilot Mode)
+
+If the drone is behaving unexpectedly during a scan, click **Manual Override** to take control.
+
+- **Requirements**: a connected Tello stream (see section above).
+- **Behavior**: keeps the live video running but **pauses ML inference** while you fly manually.
+- **Controls** (in the control window):
+  - **W/A/S/D**: forward/left/back/right
+  - **R/F**: up/down
+  - **Q/E**: rotate left/right
+  - **T / L**: takeoff / land
+  - **X**: emergency stop (zero RC)
+  - **I/K/J/O**: flips forward/back/left/right
+
 ### Dashboard Features
 
 - **Start Scan:** Accesses your local webcam (`cv2.VideoCapture(0)`) to run a continuous loop, analyzing a new frame every 1 second to prevent API rate-limiting. 
@@ -72,6 +110,7 @@ python collision_gui.py
 - **Upload Image:** Pauses any active live feeds and opens a file dialog to analyze a single local image (`.jpg`, `.png`).
 - **View Report:** Opens a pop-up window reading from `crash_report_log.txt`, detailing the history of detected crashes and vehicle counts.
 - **Status Panel:** Dynamically updates to show the total number of vehicles involved in an active crash scene.
+- **Safety Perimeter Simulation:** Runs a drone navigation animation on the right panel and deploys cones around a simulated crash site. Can be started manually via **Run Simulation**, and also auto-triggers when a crash is detected.
 
 ---
 
@@ -80,6 +119,7 @@ python collision_gui.py
 - **Unified Canvas Display:** Both live drone feeds and uploaded images are routed through a central renderer that automatically resizes frames to fit the Tkinter layout using `Image.Resampling.LANCZOS`.
 - **Automated Logging:** Whenever a frame analysis returns a "CRASH DETECTED" string, the GUI automatically appends a timestamp, filename, and result message to a local `crash_report_log.txt` file.
 - **Decoupled Backend:** The GUI imports `CrashAnalysisApp` from `analysis.py`. All API requests, YOLO overlap checks, and bounding box math are executed by the backend app before being returned to the GUI for rendering.
+- **No OneDrive temp-frame churn:** Live scan frames are written to the OS temp directory and cleaned up automatically (instead of writing `temp_live_frame.jpg` into the project folder).
 
 ---
 
@@ -90,4 +130,6 @@ python collision_gui.py
 | `Missing ROBOFLOW_API_KEY` | Ensure your `.env` file is in the same directory as `collision_gui.py` and correctly formatted. |
 | GUI Freezes / Becomes Unresponsive | Ensure `update_scan()` is using `self.root.after()` rather than a `while True` loop, which blocks Tkinter's main event thread. |
 | Cannot open camera feed | Check system privacy settings to ensure Python has permission to access the webcam, or verify the camera index in `cv2.VideoCapture(0)`. |
+| Tello video doesn’t connect | Confirm you are connected to the drone’s Wi‑Fi (SSID usually `TELLO-xxxxxx`). Also ensure `USE_TELLO=1` and `pip install djitellopy` in the same venv you run the GUI with. |
 | `AttributeError: module 'cv2' has no attribute...` | A corrupt OpenCV installation. Run `pip uninstall opencv-python` followed by `pip install opencv-python`. |
+| `ModuleNotFoundError: torch._higher_order_ops._invoke_quant` | Your PyTorch build is too old/incomplete for your `ultralytics` version. Upgrade CPU wheels: `python -m pip install --upgrade --index-url https://download.pytorch.org/whl/cpu torch torchvision` |
