@@ -1,0 +1,110 @@
+import cv2
+import numpy as np
+from inference import get_model
+
+# --- 1. Setup Background Image ---
+image_path = "/Users/jarichen/Downloads/carcrash11.jpeg"
+image = cv2.imread(image_path)
+height, width, _ = image.shape
+
+# --- 2. Load the Drone Overlay ---
+drone_img_path = "/Users/jarichen/Downloads/drone.png" 
+drone_img = cv2.imread(drone_img_path, cv2.IMREAD_UNCHANGED)
+
+if drone_img is None:
+    print(f"Error: Could not load drone image from {drone_img_path}")
+    exit()
+
+if height<width:
+    drone_w = height//10
+else:
+    drone_w = width//10
+
+ar = drone_img.shape[0] / drone_img.shape[1]
+drone_h = int(drone_w * ar)
+drone_resized = cv2.resize(drone_img, (drone_w, drone_h), interpolation=cv2.INTER_AREA)
+drone_center_x = drone_w // 2
+drone_center_y = drone_h // 2
+
+
+# --- 3. Model Inference ---
+model = get_model(model_id="car-top-view-et1kd/1", api_key="7FHrjaDYOIsWPkz5Aa8r")
+results = model.infer(image, confidence=0.6)[0]
+
+# --- 4. Alpha Overlay Function ---
+def overlay_transparent(bg_img, overlay_img, x, y):
+    h, w, c = overlay_img.shape
+    if c != 4: return bg_img
+    if x < 0 or y < 0 or x + w > bg_img.shape[1] or y + h > bg_img.shape[0]:
+        return bg_img
+    overlay_bgr = overlay_img[:, :, :3]
+    overlay_alpha = overlay_img[:, :, 3] / 255.0
+    background_alpha = 1.0 - overlay_alpha
+    roi = bg_img[y:y+h, x:x+w]
+    for color in range(3):
+        roi[:, :, color] = (overlay_alpha * overlay_bgr[:, :, color] + 
+                           background_alpha * roi[:, :, color])
+    return bg_img
+
+# --- 5. Simulation Logic ---
+window_name = "Drone Security Perimeter Scan"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(window_name, width, height)
+
+base_image = image.copy()
+
+for pred in results.predictions:
+    w, h = pred.width, pred.height
+    x1, y1 = int(pred.x - w / 2), int(pred.y - h / 2)
+    x2, y2 = int(pred.x + w / 2), int(pred.y + h / 2)
+    
+    cv2.rectangle(base_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+    cv2.putText(base_image, "Crash Detected", (x1, y1 - 10), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    pad_w, pad_h = int(w)//2, int(w)//2
+    bx1, by1 = max(0, x1 - pad_w), max(0, y1 - pad_h)
+    bx2, by2 = min(width, x2 + pad_w), min(height, y2 + pad_h)
+
+    path = [(bx1, by1), (bx2, by1), (bx2, by2), (bx1, by2), (bx1, by1)]
+
+    for s in range(len(path) - 1):
+        start_pt = path[s]
+        end_pt = path[s+1]
+        line_steps = 40 
+
+        # Calculate the distance of this specific side
+        side_dist = ((end_pt[0]-start_pt[0])**2 + (end_pt[1]-start_pt[1])**2)**0.5
+        # Determine how many steps represent a "half-width" distance
+        steps_per_stop = int(line_steps * ((w / 2) / side_dist))
+
+        for i in range(1, line_steps + 1):
+            temp_frame = base_image.copy()
+            curr_x = int(start_pt[0] + (end_pt[0] - start_pt[0]) * (i / line_steps))
+            curr_y = int(start_pt[1] + (end_pt[1] - start_pt[1]) * (i / line_steps))
+            
+            cv2.line(temp_frame, start_pt, (curr_x, curr_y), (0, 0, 255), 2)
+            drone_draw_x = curr_x - drone_center_x
+            drone_draw_y = curr_y - drone_center_y
+            temp_frame = overlay_transparent(temp_frame, drone_resized, drone_draw_x, drone_draw_y)
+            
+            cv2.imshow(window_name, temp_frame)
+            
+            # --- THE STOP LOGIC ---
+            # If we've reached a half-width interval, pause
+            if i % max(1, steps_per_stop) == 0 and i < line_steps:
+                cv2.putText(temp_frame, "Placing cone...", (drone_draw_x, drone_draw_y - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.imshow(window_name, temp_frame)
+                cv2.waitKey(700) # Pause for 0.5 seconds
+            else:
+                cv2.waitKey(50) 
+        
+        cv2.line(base_image, start_pt, end_pt, (0, 0, 255), 2)
+
+    cv2.putText(base_image, "SECURE_PERIMETER_ACTIVE", (bx1 + 5, by1 + 20), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+print("Simulation Finished.")
+cv2.waitKey(0)
+cv2.destroyAllWindows()
